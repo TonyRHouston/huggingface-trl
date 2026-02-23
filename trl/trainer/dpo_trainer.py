@@ -90,6 +90,63 @@ def get_dataset_column_names(dataset: Dataset | IterableDataset) -> list[str]:
     return list(next(iter(dataset)).keys()) if dataset.column_names is None else dataset.column_names
 
 
+def flatten_batch_for_padding_free(
+    input_ids: torch.Tensor, attention_mask: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Flattens a right-padded batch for padding-free attention.
+
+    Args:
+        input_ids (`torch.Tensor`):
+            Tensor of token IDs with shape `(batch_size, sequence_length)`.
+        attention_mask (`torch.Tensor`):
+            Tensor with shape `(batch_size, sequence_length)` where non-padding tokens are marked with `1`.
+
+    Returns:
+        `tuple[torch.Tensor, torch.Tensor]`:
+            A tuple `(flat_input_ids, flat_position_ids)` where:
+            - `flat_input_ids` has shape `(1, total_non_padding_tokens)` and contains all non-padding tokens.
+            - `flat_position_ids` has shape `(1, total_non_padding_tokens)` and resets positions at each sequence
+              boundary.
+    """
+    non_padding_mask = attention_mask.bool()
+    position_ids = attention_mask.cumsum(dim=1) - 1
+    position_ids = position_ids.masked_fill(~non_padding_mask, 0)
+    flat_input_ids = input_ids[non_padding_mask].unsqueeze(0)
+    flat_position_ids = position_ids[non_padding_mask].unsqueeze(0)
+    return flat_input_ids, flat_position_ids
+
+
+def restore_padding_from_flattened(
+    tensor: torch.Tensor, flat_position_ids: torch.Tensor, padding_value: int = 0
+) -> torch.Tensor:
+    """
+    Restores per-example padding from a flattened tensor produced in padding-free mode.
+
+    This helper is designed for shifted next-token tensors (for example, logits computed with `[..., :-1, :]`), so the
+    restored sequence length is derived from `flat_position_ids` and corresponds to `sequence_lengths - 1`.
+
+    Args:
+        tensor (`torch.Tensor`):
+            Flattened tensor with shape `(1, total_non_padding_tokens - 1, ...)`.
+        flat_position_ids (`torch.Tensor`):
+            Flattened position IDs returned by [`flatten_batch_for_padding_free`] with shape `(1,
+            total_non_padding_tokens)`.
+        padding_value (`int`, *optional*, defaults to `0`):
+            Value used to pad restored sequences to a common length.
+
+    Returns:
+        `torch.Tensor`:
+            Restored tensor with shape `(batch_size, max(sequence_lengths - 1), ...)`.
+    """
+    keep_mask = flat_position_ids[:, 1:].ne(0).squeeze(0)
+    tensor = tensor.squeeze(0)[keep_mask]
+    starts = flat_position_ids.squeeze(0).eq(0).nonzero(as_tuple=True)[0]
+    ends = torch.cat((starts[1:], starts.new_tensor([flat_position_ids.size(1)])))
+    split_lengths = (ends - starts - 1).clamp_min(0).tolist()
+    return pad(list(tensor.split(split_lengths, dim=0)), padding_value=padding_value)
+
+
 @dataclass
 class DataCollatorForPreference(DataCollatorMixin):
     """
@@ -986,25 +1043,6 @@ class DPOTrainer(BaseTrainer):
 
         return input_ids, attention_mask, completion_mask
 
-    def _flatten_batch_for_padding_free(
-        self, input_ids: torch.Tensor, attention_mask: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        non_padding_mask = attention_mask.bool()
-        position_ids = attention_mask.cumsum(dim=1) - 1
-        position_ids = position_ids.masked_fill(~non_padding_mask, 0)
-        seq_lengths = non_padding_mask.sum(dim=1)
-        flat_input_ids = input_ids[non_padding_mask].unsqueeze(0)
-        flat_position_ids = position_ids[non_padding_mask].unsqueeze(0)
-        return flat_input_ids, flat_position_ids, seq_lengths
-
-    def _restore_padding_from_flattened(
-        self, tensor: torch.Tensor, flat_position_ids: torch.Tensor, seq_lengths: torch.Tensor, padding_value: int = 0
-    ) -> torch.Tensor:
-        keep_mask = flat_position_ids[:, 1:].ne(0).squeeze(0)
-        tensor = tensor.squeeze(0)[keep_mask]
-        split_lengths = (seq_lengths - 1).clamp_min(0).tolist()
-        return pad(list(tensor.split(split_lengths, dim=0)), padding_value=padding_value)
-
     def compute_ref_log_probs(self, inputs):
         """Computes reference log probabilities for a single padded batch."""
         device = self.accelerator.device
@@ -1017,10 +1055,8 @@ class DPOTrainer(BaseTrainer):
         shift_labels = input_ids[..., 1:].contiguous()
         shift_completion_mask = completion_mask[..., 1:].contiguous()
         if self.padding_free:
-            model_input_ids, flat_position_ids, seq_lengths = self._flatten_batch_for_padding_free(
-                input_ids, attention_mask
-            )
-            model_kwargs = {"input_ids": model_input_ids, "position_ids": flat_position_ids, "use_cache": False}
+            flat_input_ids, flat_position_ids = flatten_batch_for_padding_free(input_ids, attention_mask)
+            model_kwargs = {"input_ids": flat_input_ids, "position_ids": flat_position_ids, "use_cache": False}
         else:
             model_kwargs = {"input_ids": input_ids, "attention_mask": attention_mask, "use_cache": False}
         for key in ("pixel_values", "pixel_attention_mask", "image_grid_thw", "image_sizes", "token_type_ids"):
@@ -1040,7 +1076,7 @@ class DPOTrainer(BaseTrainer):
 
         ref_shift_logits = ref_outputs.logits[..., :-1, :].contiguous()
         if self.padding_free:
-            ref_shift_logits = self._restore_padding_from_flattened(ref_shift_logits, flat_position_ids, seq_lengths)
+            ref_shift_logits = restore_padding_from_flattened(ref_shift_logits, flat_position_ids)
         ref_per_token_logps = selective_log_softmax(ref_shift_logits, shift_labels)
         ref_per_token_logps[shift_completion_mask == 0] = 0.0
 
@@ -1076,10 +1112,8 @@ class DPOTrainer(BaseTrainer):
         input_ids, attention_mask, completion_mask = self._truncate_inputs(input_ids, attention_mask, completion_mask)
 
         if self.padding_free:
-            model_input_ids, flat_position_ids, seq_lengths = self._flatten_batch_for_padding_free(
-                input_ids, attention_mask
-            )
-            decoder_kwargs = {"input_ids": model_input_ids, "position_ids": flat_position_ids, "use_cache": False}
+            flat_input_ids, flat_position_ids = flatten_batch_for_padding_free(input_ids, attention_mask)
+            decoder_kwargs = {"input_ids": flat_input_ids, "position_ids": flat_position_ids, "use_cache": False}
         else:
             decoder_kwargs = {"input_ids": input_ids, "attention_mask": attention_mask, "use_cache": False}
 
@@ -1087,7 +1121,7 @@ class DPOTrainer(BaseTrainer):
         outputs = decoder(**decoder_kwargs)
         hidden_states = outputs.last_hidden_state[:, :-1].contiguous()
         if self.padding_free:
-            hidden_states = self._restore_padding_from_flattened(hidden_states, flat_position_ids, seq_lengths)
+            hidden_states = restore_padding_from_flattened(hidden_states, flat_position_ids)
         lm_head = model.get_output_embeddings()
         weight = lm_head.weight
         bias = lm_head.bias
@@ -1101,9 +1135,7 @@ class DPOTrainer(BaseTrainer):
                 ref_lm_head = self.ref_model.get_output_embeddings()
                 ref_hidden_states = ref_outputs.last_hidden_state[:, :-1].contiguous()
                 if self.padding_free:
-                    ref_hidden_states = self._restore_padding_from_flattened(
-                        ref_hidden_states, flat_position_ids, seq_lengths
-                    )
+                    ref_hidden_states = restore_padding_from_flattened(ref_hidden_states, flat_position_ids)
                 ref_weight = ref_lm_head.weight
                 ref_bias = ref_lm_head.bias
 
@@ -1163,10 +1195,8 @@ class DPOTrainer(BaseTrainer):
         input_ids, attention_mask, completion_mask = self._truncate_inputs(input_ids, attention_mask, completion_mask)
 
         if self.padding_free:
-            model_input_ids, flat_position_ids, seq_lengths = self._flatten_batch_for_padding_free(
-                input_ids, attention_mask
-            )
-            model_kwargs = {"input_ids": model_input_ids, "position_ids": flat_position_ids, "use_cache": False}
+            flat_input_ids, flat_position_ids = flatten_batch_for_padding_free(input_ids, attention_mask)
+            model_kwargs = {"input_ids": flat_input_ids, "position_ids": flat_position_ids, "use_cache": False}
         else:
             model_kwargs = {"input_ids": input_ids, "attention_mask": attention_mask, "use_cache": False}
         for key in ("pixel_values", "pixel_attention_mask", "image_grid_thw", "image_sizes", "token_type_ids"):
@@ -1179,7 +1209,7 @@ class DPOTrainer(BaseTrainer):
         outputs = model(**model_kwargs)
         shift_logits = outputs.logits[..., :-1, :].contiguous()
         if self.padding_free:
-            shift_logits = self._restore_padding_from_flattened(shift_logits, flat_position_ids, seq_lengths)
+            shift_logits = restore_padding_from_flattened(shift_logits, flat_position_ids)
         shift_labels = input_ids[..., 1:].contiguous()
         shift_completion_mask = completion_mask[..., 1:].contiguous()
         per_token_logps = selective_log_softmax(shift_logits, shift_labels)
@@ -1218,9 +1248,7 @@ class DPOTrainer(BaseTrainer):
 
             ref_shift_logits = ref_outputs.logits[..., :-1, :].contiguous()
             if self.padding_free:
-                ref_shift_logits = self._restore_padding_from_flattened(
-                    ref_shift_logits, flat_position_ids, seq_lengths
-                )
+                ref_shift_logits = restore_padding_from_flattened(ref_shift_logits, flat_position_ids)
             ref_per_token_logps = selective_log_softmax(ref_shift_logits, shift_labels)
             ref_per_token_logps[shift_completion_mask == 0] = 0.0  # mask out non-completion tokens
             if self.ld_alpha is None:
