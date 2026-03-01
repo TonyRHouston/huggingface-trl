@@ -29,8 +29,7 @@ jobs:
         - '3.12'
         - '3.13'
       fail-fast: false
-    runs-on:
-      group: aws-g4dn-2xlarge
+    runs-on: ubuntu-latest
     container:
       image: pytorch/pytorch:2.8.0-cuda12.8-cudnn9-devel
       options: --gpus all
@@ -81,8 +80,7 @@ jobs:
         slack_token: ${{ secrets.SLACK_CIFEEDBACK_BOT_TOKEN }}
   tests_dev:
     name: Tests with dev dependencies
-    runs-on:
-      group: aws-g4dn-2xlarge
+    runs-on: ubuntu-latest
     container:
       image: pytorch/pytorch:2.8.0-cuda12.8-cudnn9-devel
       options: --gpus all
@@ -141,8 +139,7 @@ jobs:
         slack_token: ${{ secrets.SLACK_CIFEEDBACK_BOT_TOKEN }}
   tests_wo_optional_deps:
     name: Tests without optional dependencies
-    runs-on:
-      group: aws-g4dn-2xlarge
+    runs-on: ubuntu-latest
     container:
       image: pytorch/pytorch:2.8.0-cuda12.8-cudnn9-devel
       options: --gpus all
@@ -193,8 +190,7 @@ jobs:
         slack_token: ${{ secrets.SLACK_CIFEEDBACK_BOT_TOKEN }}
   tests_min_versions:
     name: Tests with minimum versions
-    runs-on:
-      group: aws-g4dn-2xlarge
+    runs-on: ubuntu-latest
     container:
       image: pytorch/pytorch:2.8.0-cuda12.8-cudnn9-devel
       options: --gpus all
@@ -251,8 +247,7 @@ jobs:
         slack_token: ${{ secrets.SLACK_CIFEEDBACK_BOT_TOKEN }}
   distributed_smoke:
     name: Distributed smoke tests
-    runs-on:
-      group: aws-g5-12xlarge-cache
+    runs-on: ubuntu-latest
     container:
       image: pytorch/pytorch:2.8.0-cuda12.8-cudnn9-devel
       options: --gpus all
